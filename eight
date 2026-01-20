@@ -9,15 +9,18 @@ import json
 import os
 import sys
 import time
-from io import BytesIO
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 import urllib.request
 import urllib.error
+
+__version__ = "0.2.0"
 
 # API Configuration (from pyEight - extracted from Android APK)
 AUTH_URL = "https://auth-api.8slp.net/v1/tokens"
 CLIENT_API_URL = "https://client-api.8slp.net/v1"
+APP_API_URL = "https://app-api.8slp.net/v1"
 CLIENT_ID = "0894c7f33bb94800a03f1f4df13a4f38"
 CLIENT_SECRET = "f0954a3ed5763ba3d06834c73731a32f15f168f47d4f164751275def86db0c76"
 
@@ -34,9 +37,25 @@ CONFIG_DIR = Path.home() / ".config" / "eight"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 TOKEN_FILE = CONFIG_DIR / "token.json"
 
+# Temperature conversion maps (more granular)
+RAW_TO_FAHRENHEIT = {
+    -100: 55, -90: 57, -80: 59, -70: 61, -60: 63, -50: 66, -40: 68, -30: 70,
+    -20: 72, -10: 75, 0: 77, 10: 80, 20: 82, 30: 85, 40: 88, 50: 91,
+    60: 94, 70: 97, 80: 100, 90: 104, 100: 110
+}
+
+RAW_TO_CELSIUS = {
+    -100: 13, -90: 14, -80: 15, -70: 16, -60: 17, -50: 19, -40: 20, -30: 21,
+    -20: 22, -10: 24, 0: 25, 10: 27, 20: 28, 30: 29, 40: 31, 50: 33,
+    60: 34, 70: 36, 80: 38, 90: 40, 100: 44
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config & Token Management
+# ─────────────────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
-    """Load config from file."""
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
             return json.load(f)
@@ -44,7 +63,6 @@ def load_config() -> dict:
 
 
 def save_config(config: dict):
-    """Save config to file."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
@@ -52,13 +70,11 @@ def save_config(config: dict):
 
 
 def load_token() -> Optional[dict]:
-    """Load cached token if valid."""
     if not TOKEN_FILE.exists():
         return None
     try:
         with open(TOKEN_FILE) as f:
             token = json.load(f)
-        # Check expiration with 120s buffer
         if token.get("expires_at", 0) > time.time() + 120:
             return token
     except (json.JSONDecodeError, KeyError):
@@ -67,44 +83,77 @@ def load_token() -> Optional[dict]:
 
 
 def save_token(token: dict):
-    """Save token to cache."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(TOKEN_FILE, "w") as f:
         json.dump(token, f, indent=2)
     os.chmod(TOKEN_FILE, 0o600)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# API Layer with Retry
+# ─────────────────────────────────────────────────────────────────────────────
+
 def decode_response(resp) -> bytes:
-    """Decode response, handling gzip if needed."""
     data = resp.read()
     if resp.headers.get("Content-Encoding") == "gzip":
         data = gzip.decompress(data)
     return data
 
 
-def api_request(method: str, url: str, data: dict = None, token: str = None) -> dict:
-    """Make an API request."""
+def api_request(method: str, url: str, data: dict = None, token: str = None,
+                retries: int = 3, backoff: float = 1.0) -> dict:
+    """Make an API request with retry and exponential backoff."""
     headers = DEFAULT_HEADERS.copy()
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
     body = json.dumps(data).encode() if data else None
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    last_error = None
 
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(decode_response(resp).decode())
-    except urllib.error.HTTPError as e:
-        error_body = decode_response(e).decode()
+    for attempt in range(retries):
         try:
-            error_json = json.loads(error_body)
-            raise RuntimeError(f"API error {e.code}: {error_json}")
-        except json.JSONDecodeError:
-            raise RuntimeError(f"API error {e.code}: {error_body}")
+            req = urllib.request.Request(url, data=body, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(decode_response(resp).decode())
+        except urllib.error.HTTPError as e:
+            error_body = decode_response(e).decode()
+
+            # Rate limited - wait and retry
+            if e.code == 429:
+                wait = backoff * (2 ** attempt)
+                print(f"Rate limited. Waiting {wait:.1f}s...", file=sys.stderr)
+                time.sleep(wait)
+                last_error = e
+                continue
+
+            # Auth error - don't retry
+            if e.code in (401, 403):
+                try:
+                    error_json = json.loads(error_body)
+                    raise RuntimeError(f"Auth error: {error_json}")
+                except json.JSONDecodeError:
+                    raise RuntimeError(f"Auth error {e.code}: {error_body}")
+
+            # Other errors
+            try:
+                error_json = json.loads(error_body)
+                raise RuntimeError(f"API error {e.code}: {error_json}")
+            except json.JSONDecodeError:
+                raise RuntimeError(f"API error {e.code}: {error_body}")
+
+        except urllib.error.URLError as e:
+            last_error = e
+            if attempt < retries - 1:
+                wait = backoff * (2 ** attempt)
+                print(f"Connection error. Retrying in {wait:.1f}s...", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"Connection failed: {e.reason}")
+
+    raise RuntimeError(f"Max retries exceeded. Last error: {last_error}")
 
 
 def authenticate(email: str, password: str) -> dict:
-    """Authenticate and get token."""
     data = {
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
@@ -114,9 +163,8 @@ def authenticate(email: str, password: str) -> dict:
     }
 
     result = api_request("POST", AUTH_URL, data)
-
-    # Calculate expiration timestamp
     expires_in = result.get("expires_in", 3600)
+
     token_data = {
         "access_token": result["access_token"],
         "user_id": result["userId"],
@@ -127,7 +175,6 @@ def authenticate(email: str, password: str) -> dict:
 
 
 def get_token() -> dict:
-    """Get valid token, refreshing if needed."""
     token = load_token()
     if token:
         return token
@@ -143,72 +190,97 @@ def get_token() -> dict:
     return authenticate(email, password)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# API Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
 def get_user_data(token: dict) -> dict:
-    """Get user and device data."""
     url = f"{CLIENT_API_URL}/users/me"
     return api_request("GET", url, token=token["access_token"])
 
 
 def get_device_data(token: dict, device_id: str) -> dict:
-    """Get device data."""
     url = f"{CLIENT_API_URL}/devices/{device_id}"
     return api_request("GET", url, token=token["access_token"])
 
 
 def get_temperature(token: dict, user_id: str) -> dict:
-    """Get temperature state."""
     url = f"{CLIENT_API_URL}/users/{user_id}/temperature"
     return api_request("GET", url, token=token["access_token"])
 
 
-def set_temperature(token: dict, user_id: str, level: int):
-    """Set temperature level (-100 to 100)."""
+def set_temperature(token: dict, user_id: str, level: int) -> dict:
     url = f"{CLIENT_API_URL}/users/{user_id}/temperature"
-    data = {"currentLevel": level}
+    return api_request("PUT", url, {"currentLevel": level}, token=token["access_token"])
+
+
+def turn_on(token: dict, user_id: str) -> dict:
+    url = f"{CLIENT_API_URL}/users/{user_id}/temperature"
+    return api_request("PUT", url, {"currentState": {"type": "smart"}}, token=token["access_token"])
+
+
+def turn_off(token: dict, user_id: str) -> dict:
+    url = f"{CLIENT_API_URL}/users/{user_id}/temperature"
+    return api_request("PUT", url, {"currentState": {"type": "off"}}, token=token["access_token"])
+
+
+def get_user_trends(token: dict, user_id: str, start: str, end: str) -> dict:
+    url = f"{CLIENT_API_URL}/users/{user_id}/trends?tz=UTC&from={start}&to={end}"
+    return api_request("GET", url, token=token["access_token"])
+
+
+def get_alarms(token: dict, user_id: str) -> dict:
+    url = f"{APP_API_URL}/users/{user_id}/alarms"
+    return api_request("GET", url, token=token["access_token"])
+
+
+def set_alarm(token: dict, user_id: str, alarm_id: str, data: dict) -> dict:
+    url = f"{APP_API_URL}/users/{user_id}/alarms/{alarm_id}"
     return api_request("PUT", url, data, token=token["access_token"])
 
 
-def turn_on(token: dict, user_id: str):
-    """Turn on the bed side."""
-    url = f"{CLIENT_API_URL}/users/{user_id}/temperature"
-    data = {"currentState": {"type": "smart"}}
-    return api_request("PUT", url, data, token=token["access_token"])
+def get_device_info(token: dict) -> Tuple[dict, str, str, str]:
+    """Get device info and determine user's side. Returns (device, device_id, user_id, side)."""
+    user_data = get_user_data(token)
+    user_id = token["user_id"]
+    devices = user_data.get("user", {}).get("devices", [])
+
+    if not devices:
+        raise RuntimeError("No devices found")
+
+    device_id = devices[0]
+    device_data = get_device_data(token, device_id)
+    device = device_data.get("result", {})
+
+    left_user = device.get("leftUserId")
+    right_user = device.get("rightUserId")
+    side = "left" if left_user == user_id else "right" if right_user == user_id else "unknown"
+
+    return device, device_id, user_id, side
 
 
-def turn_off(token: dict, user_id: str):
-    """Turn off the bed side."""
-    url = f"{CLIENT_API_URL}/users/{user_id}/temperature"
-    data = {"currentState": {"type": "off"}}
-    return api_request("PUT", url, data, token=token["access_token"])
+def get_other_user_id(token: dict, device: dict, current_side: str) -> Optional[str]:
+    """Get the user ID for the other side of the bed."""
+    if current_side == "left":
+        return device.get("rightUserId")
+    elif current_side == "right":
+        return device.get("leftUserId")
+    return None
 
 
-# Temperature conversion maps
-RAW_TO_FAHRENHEIT = {
-    -100: 55, -90: 57, -80: 59, -70: 61, -60: 63, -50: 66, -40: 68, -30: 70,
-    -20: 72, -10: 75, 0: 77, 10: 80, 20: 82, 30: 85, 40: 88, 50: 91,
-    60: 94, 70: 97, 80: 100, 90: 104, 100: 110
-}
-
-RAW_TO_CELSIUS = {
-    -100: 13, -90: 14, -80: 15, -70: 16, -60: 17, -50: 19, -40: 20, -30: 21,
-    -20: 22, -10: 24, 0: 25, 10: 27, 20: 28, 30: 29, 40: 31, 50: 33,
-    60: 34, 70: 36, 80: 38, 90: 40, 100: 44
-}
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Temperature Utilities
+# ─────────────────────────────────────────────────────────────────────────────
 
 def raw_to_temp(raw: int, unit: str = "F") -> int:
-    """Convert raw level to temperature."""
     mapping = RAW_TO_FAHRENHEIT if unit == "F" else RAW_TO_CELSIUS
-    # Find closest key
     keys = sorted(mapping.keys())
     closest = min(keys, key=lambda k: abs(k - raw))
     return mapping[closest]
 
 
 def temp_to_raw(temp: int, unit: str = "F") -> int:
-    """Convert temperature to raw level."""
     mapping = RAW_TO_FAHRENHEIT if unit == "F" else RAW_TO_CELSIUS
-    # Find closest value
     for raw, t in sorted(mapping.items()):
         if t >= temp:
             return raw
@@ -216,7 +288,6 @@ def temp_to_raw(temp: int, unit: str = "F") -> int:
 
 
 def parse_temp_arg(arg: str) -> int:
-    """Parse temperature argument like '68F', '20C', or '-50'."""
     arg = arg.strip().upper()
     if arg.endswith("F"):
         return temp_to_raw(int(arg[:-1]), "F")
@@ -229,10 +300,32 @@ def parse_temp_arg(arg: str) -> int:
         raise ValueError("Raw level must be between -100 and 100")
 
 
+def format_temp(level: int) -> str:
+    return f"{raw_to_temp(level, 'F')}F / {raw_to_temp(level, 'C')}C"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI Commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+def resolve_user_id(args) -> Tuple[dict, str, str]:
+    """Resolve the user ID based on --side flag. Returns (token, user_id, side)."""
+    token = get_token()
+    device, device_id, user_id, my_side = get_device_info(token)
+
+    requested_side = getattr(args, 'side', None)
+
+    if requested_side and requested_side != my_side:
+        other_user_id = get_other_user_id(token, device, my_side)
+        if other_user_id:
+            return token, other_user_id, requested_side
+        else:
+            print(f"Warning: No user on {requested_side} side, using {my_side}", file=sys.stderr)
+
+    return token, user_id, my_side
+
 
 def cmd_login(args):
-    """Configure credentials."""
     email = args.email or input("Email: ")
     password = args.password or input("Password: ")
 
@@ -248,7 +341,6 @@ def cmd_login(args):
 
 
 def cmd_logout(args):
-    """Clear cached credentials."""
     if TOKEN_FILE.exists():
         TOKEN_FILE.unlink()
     if CONFIG_FILE.exists():
@@ -257,73 +349,324 @@ def cmd_logout(args):
 
 
 def cmd_status(args):
-    """Show device status."""
-    token = get_token()
-    user_data = get_user_data(token)
-
-    user_id = token["user_id"]
-    devices = user_data.get("user", {}).get("devices", [])
-
-    if not devices:
-        print("No devices found.")
-        return
-
-    device_id = devices[0]
-    device_data = get_device_data(token, device_id)
+    token, user_id, side = resolve_user_id(args)
     temp_data = get_temperature(token, user_id)
-
-    # Find which side this user is on
-    device = device_data.get("result", {})
-    left_user = device.get("leftUserId")
-    right_user = device.get("rightUserId")
-
-    side = "left" if left_user == user_id else "right" if right_user == user_id else "unknown"
 
     current_level = temp_data.get("currentLevel", 0)
     current_state = temp_data.get("currentState", {}).get("type", "unknown")
 
-    temp_f = raw_to_temp(current_level, "F")
-    temp_c = raw_to_temp(current_level, "C")
+    if args.json:
+        print(json.dumps(temp_data, indent=2))
+        return
 
     print(f"Side:        {side}")
     print(f"State:       {current_state}")
     print(f"Level:       {current_level}")
-    print(f"Temperature: {temp_f}F / {temp_c}C")
-
-    if args.json:
-        print(json.dumps({"temp": temp_data, "device": device}, indent=2))
+    print(f"Temperature: {format_temp(current_level)}")
 
 
 def cmd_temp(args):
-    """Set temperature."""
-    token = get_token()
+    token, user_id, side = resolve_user_id(args)
     level = parse_temp_arg(args.level)
 
-    print(f"Setting temperature to level {level} ({raw_to_temp(level, 'F')}F)...")
-    set_temperature(token, token["user_id"], level)
+    print(f"Setting {side} side to level {level} ({format_temp(level)})...")
+    set_temperature(token, user_id, level)
     print("Done.")
 
 
 def cmd_on(args):
-    """Turn on."""
-    token = get_token()
-    print("Turning on...")
-    turn_on(token, token["user_id"])
+    token, user_id, side = resolve_user_id(args)
+    print(f"Turning on {side} side...")
+    turn_on(token, user_id)
     print("Done.")
 
 
 def cmd_off(args):
-    """Turn off."""
-    token = get_token()
-    print("Turning off...")
-    turn_off(token, token["user_id"])
+    token, user_id, side = resolve_user_id(args)
+    print(f"Turning off {side} side...")
+    turn_off(token, user_id)
     print("Done.")
 
 
 def cmd_whoami(args):
-    """Show current user."""
     token = get_token()
-    print(f"User ID: {token['user_id']}")
+    device, device_id, user_id, side = get_device_info(token)
+
+    print(f"User ID:   {user_id}")
+    print(f"Device ID: {device_id}")
+    print(f"Side:      {side}")
+
+    # Show other user if present
+    other_id = get_other_user_id(token, device, side)
+    if other_id:
+        other_side = "right" if side == "left" else "left"
+        print(f"Partner:   {other_id} ({other_side})")
+
+
+def cmd_presence(args):
+    token = get_token()
+    device, device_id, user_id, my_side = get_device_info(token)
+
+    # Get presence from device data
+    left_presence = device.get("leftPresence", False)
+    right_presence = device.get("rightPresence", False)
+
+    if args.json:
+        print(json.dumps({"left": left_presence, "right": right_presence}))
+        return
+
+    def status(present):
+        return "in bed" if present else "not in bed"
+
+    if args.side:
+        presence = left_presence if args.side == "left" else right_presence
+        print(status(presence))
+    else:
+        print(f"Left:  {status(left_presence)}")
+        print(f"Right: {status(right_presence)}")
+
+
+def cmd_sleep(args):
+    token, user_id, side = resolve_user_id(args)
+
+    # Default to last 7 days
+    days = args.days or 7
+    end_date = datetime.now(timezone.utc)
+    start_date = end_date - timedelta(days=days)
+
+    start = start_date.strftime("%Y-%m-%d")
+    end = end_date.strftime("%Y-%m-%d")
+
+    trends = get_user_trends(token, user_id, start, end)
+
+    if args.json:
+        print(json.dumps(trends, indent=2))
+        return
+
+    days_data = trends.get("days", [])
+    if not days_data:
+        print("No sleep data available.")
+        return
+
+    print(f"Sleep data for {side} side ({len(days_data)} nights):\n")
+
+    for day in reversed(days_data[-7:]):  # Show last 7
+        date = day.get("day", "Unknown")
+        score = day.get("score", 0)
+        duration_sec = day.get("sleepDuration", 0)
+        duration_hrs = duration_sec / 3600 if duration_sec else 0
+
+        hrv = day.get("sleepQualityScore", {}).get("hrv", {}).get("current")
+        breath = day.get("sleepQualityScore", {}).get("respiratoryRate", {}).get("current")
+        hr = day.get("sleepQualityScore", {}).get("heartRate", {}).get("current")
+
+        print(f"{date}:")
+        print(f"  Score:    {score}")
+        print(f"  Duration: {duration_hrs:.1f}h")
+        if hrv:
+            print(f"  HRV:      {hrv:.0f} ms")
+        if breath:
+            print(f"  Breath:   {breath:.1f} /min")
+        if hr:
+            print(f"  Heart:    {hr:.0f} bpm")
+        print()
+
+
+def cmd_alarms(args):
+    token, user_id, side = resolve_user_id(args)
+    alarms_data = get_alarms(token, user_id)
+
+    if args.json:
+        print(json.dumps(alarms_data, indent=2))
+        return
+
+    alarms = alarms_data.get("alarms", [])
+    if not alarms:
+        print("No alarms configured.")
+        return
+
+    print(f"Alarms for {side} side:\n")
+
+    for alarm in alarms:
+        alarm_id = alarm.get("id", "?")[:8]
+        enabled = alarm.get("enabled", False)
+        time_str = alarm.get("time", "00:00:00")[:5]
+
+        # Get repeat days
+        repeat = alarm.get("repeat", {}).get("weekDays", {})
+        days = [d[:3].title() for d, v in repeat.items() if v]
+        days_str = ", ".join(days) if days else "Once"
+
+        status = "ON " if enabled else "OFF"
+        vibration = "vibrate" if alarm.get("vibration", {}).get("enabled") else ""
+        thermal = "thermal" if alarm.get("thermal", {}).get("enabled") else ""
+        features = " ".join(filter(None, [vibration, thermal]))
+
+        print(f"  [{status}] {time_str}  {days_str}")
+        if features:
+            print(f"        {features}")
+        print(f"        ID: {alarm_id}...")
+
+
+def cmd_alarm_set(args):
+    token, user_id, side = resolve_user_id(args)
+
+    # Parse time
+    time_parts = args.time.split(":")
+    if len(time_parts) == 2:
+        time_str = f"{time_parts[0].zfill(2)}:{time_parts[1].zfill(2)}:00"
+    else:
+        time_str = args.time
+
+    # Get existing alarms to find the first one
+    alarms_data = get_alarms(token, user_id)
+    alarms = alarms_data.get("alarms", [])
+
+    if not alarms:
+        print("No alarms to modify. Create one in the app first.")
+        return
+
+    alarm = alarms[0]
+    alarm_id = alarm["id"]
+
+    # Update the alarm
+    update_data = {"time": time_str, "enabled": True}
+
+    set_alarm(token, user_id, alarm_id, update_data)
+    print(f"Alarm set to {time_str[:5]} on {side} side.")
+
+
+def cmd_alarm_toggle(args, enable: bool):
+    token, user_id, side = resolve_user_id(args)
+
+    alarms_data = get_alarms(token, user_id)
+    alarms = alarms_data.get("alarms", [])
+
+    if not alarms:
+        print("No alarms configured.")
+        return
+
+    alarm = alarms[0]
+    alarm_id = alarm["id"]
+
+    set_alarm(token, user_id, alarm_id, {"enabled": enable})
+    state = "enabled" if enable else "disabled"
+    print(f"Alarm {state} on {side} side.")
+
+
+def cmd_version(args):
+    print(f"eight {__version__}")
+
+
+def cmd_completion(args):
+    shell = args.shell
+
+    if shell == "bash":
+        print('''
+_eight_completion() {
+    local cur prev commands
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    commands="login logout status temp on off whoami presence sleep alarms alarm-on alarm-off alarm-set version completion"
+
+    case "$prev" in
+        eight)
+            COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+            ;;
+        --side)
+            COMPREPLY=($(compgen -W "left right" -- "$cur"))
+            ;;
+        completion)
+            COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
+            ;;
+        *)
+            COMPREPLY=($(compgen -W "--side --json --help" -- "$cur"))
+            ;;
+    esac
+}
+complete -F _eight_completion eight
+
+# Add to ~/.bashrc:
+# eval "$(eight completion bash)"
+''')
+
+    elif shell == "zsh":
+        print('''
+#compdef eight
+
+_eight() {
+    local -a commands
+    commands=(
+        'login:Configure credentials'
+        'logout:Clear credentials'
+        'status:Show device status'
+        'temp:Set temperature'
+        'on:Turn on'
+        'off:Turn off'
+        'whoami:Show current user'
+        'presence:Check bed presence'
+        'sleep:Show sleep metrics'
+        'alarms:List alarms'
+        'alarm-on:Enable alarm'
+        'alarm-off:Disable alarm'
+        'alarm-set:Set alarm time'
+        'version:Show version'
+        'completion:Generate shell completion'
+    )
+
+    _arguments -C \\
+        '--side[Bed side]:side:(left right)' \\
+        '--json[Output JSON]' \\
+        '1: :->command' \\
+        '*::arg:->args'
+
+    case $state in
+        command)
+            _describe 'command' commands
+            ;;
+    esac
+}
+
+_eight "$@"
+
+# Add to ~/.zshrc:
+# eval "$(eight completion zsh)"
+''')
+
+    elif shell == "fish":
+        print('''
+complete -c eight -f
+
+complete -c eight -n "__fish_use_subcommand" -a login -d "Configure credentials"
+complete -c eight -n "__fish_use_subcommand" -a logout -d "Clear credentials"
+complete -c eight -n "__fish_use_subcommand" -a status -d "Show device status"
+complete -c eight -n "__fish_use_subcommand" -a temp -d "Set temperature"
+complete -c eight -n "__fish_use_subcommand" -a on -d "Turn on"
+complete -c eight -n "__fish_use_subcommand" -a off -d "Turn off"
+complete -c eight -n "__fish_use_subcommand" -a whoami -d "Show current user"
+complete -c eight -n "__fish_use_subcommand" -a presence -d "Check bed presence"
+complete -c eight -n "__fish_use_subcommand" -a sleep -d "Show sleep metrics"
+complete -c eight -n "__fish_use_subcommand" -a alarms -d "List alarms"
+complete -c eight -n "__fish_use_subcommand" -a alarm-on -d "Enable alarm"
+complete -c eight -n "__fish_use_subcommand" -a alarm-off -d "Disable alarm"
+complete -c eight -n "__fish_use_subcommand" -a alarm-set -d "Set alarm time"
+complete -c eight -n "__fish_use_subcommand" -a version -d "Show version"
+complete -c eight -n "__fish_use_subcommand" -a completion -d "Generate shell completion"
+
+complete -c eight -l side -d "Bed side" -a "left right"
+complete -c eight -l json -d "Output JSON"
+
+# Save to ~/.config/fish/completions/eight.fish
+''')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def add_side_arg(parser):
+    parser.add_argument("--side", "-s", choices=["left", "right"],
+                        help="Bed side (default: your side)")
 
 
 def main():
@@ -331,43 +674,95 @@ def main():
         prog="eight",
         description="Control your Eight Sleep Pod from the terminal."
     )
-    parser.add_argument("--quiet", "-q", action="store_true", help="Suppress info messages")
+    parser.add_argument("--version", "-V", action="store_true", help="Show version")
 
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # login
-    login_parser = subparsers.add_parser("login", help="Configure credentials")
-    login_parser.add_argument("--email", "-e", help="Eight Sleep email")
-    login_parser.add_argument("--password", "-p", help="Eight Sleep password")
-    login_parser.set_defaults(func=cmd_login)
+    p = subparsers.add_parser("login", help="Configure credentials")
+    p.add_argument("--email", "-e", help="Eight Sleep email")
+    p.add_argument("--password", "-p", help="Eight Sleep password")
+    p.set_defaults(func=cmd_login)
 
     # logout
-    logout_parser = subparsers.add_parser("logout", help="Clear credentials")
-    logout_parser.set_defaults(func=cmd_logout)
+    p = subparsers.add_parser("logout", help="Clear credentials")
+    p.set_defaults(func=cmd_logout)
 
     # status
-    status_parser = subparsers.add_parser("status", help="Show device status")
-    status_parser.add_argument("--json", action="store_true", help="Output JSON")
-    status_parser.set_defaults(func=cmd_status)
+    p = subparsers.add_parser("status", help="Show device status")
+    p.add_argument("--json", "-j", action="store_true", help="Output JSON")
+    add_side_arg(p)
+    p.set_defaults(func=cmd_status)
 
     # temp
-    temp_parser = subparsers.add_parser("temp", help="Set temperature (e.g., 68F, 20C, or -50)")
-    temp_parser.add_argument("level", help="Temperature (68F, 20C) or level (-100 to 100)")
-    temp_parser.set_defaults(func=cmd_temp)
+    p = subparsers.add_parser("temp", help="Set temperature (e.g., 68F, 20C, or -50)")
+    p.add_argument("level", help="Temperature (68F, 20C) or level (-100 to 100)")
+    add_side_arg(p)
+    p.set_defaults(func=cmd_temp)
 
     # on
-    on_parser = subparsers.add_parser("on", help="Turn on")
-    on_parser.set_defaults(func=cmd_on)
+    p = subparsers.add_parser("on", help="Turn on")
+    add_side_arg(p)
+    p.set_defaults(func=cmd_on)
 
     # off
-    off_parser = subparsers.add_parser("off", help="Turn off")
-    off_parser.set_defaults(func=cmd_off)
+    p = subparsers.add_parser("off", help="Turn off")
+    add_side_arg(p)
+    p.set_defaults(func=cmd_off)
 
     # whoami
-    whoami_parser = subparsers.add_parser("whoami", help="Show current user ID")
-    whoami_parser.set_defaults(func=cmd_whoami)
+    p = subparsers.add_parser("whoami", help="Show current user and device info")
+    p.set_defaults(func=cmd_whoami)
+
+    # presence
+    p = subparsers.add_parser("presence", help="Check if someone is in bed")
+    p.add_argument("--json", "-j", action="store_true", help="Output JSON")
+    p.add_argument("--side", "-s", choices=["left", "right"], help="Check specific side")
+    p.set_defaults(func=cmd_presence)
+
+    # sleep
+    p = subparsers.add_parser("sleep", help="Show sleep metrics")
+    p.add_argument("--days", "-d", type=int, default=7, help="Number of days (default: 7)")
+    p.add_argument("--json", "-j", action="store_true", help="Output JSON")
+    add_side_arg(p)
+    p.set_defaults(func=cmd_sleep)
+
+    # alarms
+    p = subparsers.add_parser("alarms", help="List alarms")
+    p.add_argument("--json", "-j", action="store_true", help="Output JSON")
+    add_side_arg(p)
+    p.set_defaults(func=cmd_alarms)
+
+    # alarm-on
+    p = subparsers.add_parser("alarm-on", help="Enable alarm")
+    add_side_arg(p)
+    p.set_defaults(func=lambda args: cmd_alarm_toggle(args, True))
+
+    # alarm-off
+    p = subparsers.add_parser("alarm-off", help="Disable alarm")
+    add_side_arg(p)
+    p.set_defaults(func=lambda args: cmd_alarm_toggle(args, False))
+
+    # alarm-set
+    p = subparsers.add_parser("alarm-set", help="Set alarm time (e.g., 7:30)")
+    p.add_argument("time", help="Time in HH:MM format")
+    add_side_arg(p)
+    p.set_defaults(func=cmd_alarm_set)
+
+    # version
+    p = subparsers.add_parser("version", help="Show version")
+    p.set_defaults(func=cmd_version)
+
+    # completion
+    p = subparsers.add_parser("completion", help="Generate shell completion script")
+    p.add_argument("shell", choices=["bash", "zsh", "fish"], help="Shell type")
+    p.set_defaults(func=cmd_completion)
 
     args = parser.parse_args()
+
+    if args.version:
+        cmd_version(args)
+        return
 
     if not args.command:
         parser.print_help()
