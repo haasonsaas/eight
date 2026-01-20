@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""
+Eight Sleep CLI - Control your Eight Sleep Pod from the terminal.
+"""
+
+import argparse
+import gzip
+import json
+import os
+import sys
+import time
+from io import BytesIO
+from pathlib import Path
+from typing import Optional
+import urllib.request
+import urllib.error
+
+# API Configuration (from pyEight - extracted from Android APK)
+AUTH_URL = "https://auth-api.8slp.net/v1/tokens"
+CLIENT_API_URL = "https://client-api.8slp.net/v1"
+CLIENT_ID = "0894c7f33bb94800a03f1f4df13a4f38"
+CLIENT_SECRET = "f0954a3ed5763ba3d06834c73731a32f15f168f47d4f164751275def86db0c76"
+
+# Headers mimicking Android app
+DEFAULT_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Accept-Encoding": "gzip, deflate",
+    "User-Agent": "okhttp/4.9.3",
+    "Connection": "keep-alive",
+}
+
+CONFIG_DIR = Path.home() / ".config" / "eight"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+TOKEN_FILE = CONFIG_DIR / "token.json"
+
+
+def load_config() -> dict:
+    """Load config from file."""
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_config(config: dict):
+    """Save config to file."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+    os.chmod(CONFIG_FILE, 0o600)
+
+
+def load_token() -> Optional[dict]:
+    """Load cached token if valid."""
+    if not TOKEN_FILE.exists():
+        return None
+    try:
+        with open(TOKEN_FILE) as f:
+            token = json.load(f)
+        # Check expiration with 120s buffer
+        if token.get("expires_at", 0) > time.time() + 120:
+            return token
+    except (json.JSONDecodeError, KeyError):
+        pass
+    return None
+
+
+def save_token(token: dict):
+    """Save token to cache."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(TOKEN_FILE, "w") as f:
+        json.dump(token, f, indent=2)
+    os.chmod(TOKEN_FILE, 0o600)
+
+
+def decode_response(resp) -> bytes:
+    """Decode response, handling gzip if needed."""
+    data = resp.read()
+    if resp.headers.get("Content-Encoding") == "gzip":
+        data = gzip.decompress(data)
+    return data
+
+
+def api_request(method: str, url: str, data: dict = None, token: str = None) -> dict:
+    """Make an API request."""
+    headers = DEFAULT_HEADERS.copy()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    body = json.dumps(data).encode() if data else None
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(decode_response(resp).decode())
+    except urllib.error.HTTPError as e:
+        error_body = decode_response(e).decode()
+        try:
+            error_json = json.loads(error_body)
+            raise RuntimeError(f"API error {e.code}: {error_json}")
+        except json.JSONDecodeError:
+            raise RuntimeError(f"API error {e.code}: {error_body}")
+
+
+def authenticate(email: str, password: str) -> dict:
+    """Authenticate and get token."""
+    data = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "password",
+        "username": email,
+        "password": password,
+    }
+
+    result = api_request("POST", AUTH_URL, data)
+
+    # Calculate expiration timestamp
+    expires_in = result.get("expires_in", 3600)
+    token_data = {
+        "access_token": result["access_token"],
+        "user_id": result["userId"],
+        "expires_at": time.time() + expires_in,
+    }
+    save_token(token_data)
+    return token_data
+
+
+def get_token() -> dict:
+    """Get valid token, refreshing if needed."""
+    token = load_token()
+    if token:
+        return token
+
+    config = load_config()
+    email = config.get("email")
+    password = config.get("password")
+
+    if not email or not password:
+        print("Error: Not configured. Run 'eight login' first.", file=sys.stderr)
+        sys.exit(1)
+
+    return authenticate(email, password)
+
+
+def get_user_data(token: dict) -> dict:
+    """Get user and device data."""
+    url = f"{CLIENT_API_URL}/users/me"
+    return api_request("GET", url, token=token["access_token"])
+
+
+def get_device_data(token: dict, device_id: str) -> dict:
+    """Get device data."""
+    url = f"{CLIENT_API_URL}/devices/{device_id}"
+    return api_request("GET", url, token=token["access_token"])
+
+
+def get_temperature(token: dict, user_id: str) -> dict:
+    """Get temperature state."""
+    url = f"{CLIENT_API_URL}/users/{user_id}/temperature"
+    return api_request("GET", url, token=token["access_token"])
+
+
+def set_temperature(token: dict, user_id: str, level: int):
+    """Set temperature level (-100 to 100)."""
+    url = f"{CLIENT_API_URL}/users/{user_id}/temperature"
+    data = {"currentLevel": level}
+    return api_request("PUT", url, data, token=token["access_token"])
+
+
+def turn_on(token: dict, user_id: str):
+    """Turn on the bed side."""
+    url = f"{CLIENT_API_URL}/users/{user_id}/temperature"
+    data = {"currentState": {"type": "smart"}}
+    return api_request("PUT", url, data, token=token["access_token"])
+
+
+def turn_off(token: dict, user_id: str):
+    """Turn off the bed side."""
+    url = f"{CLIENT_API_URL}/users/{user_id}/temperature"
+    data = {"currentState": {"type": "off"}}
+    return api_request("PUT", url, data, token=token["access_token"])
+
+
+# Temperature conversion maps
+RAW_TO_FAHRENHEIT = {
+    -100: 55, -90: 57, -80: 59, -70: 61, -60: 63, -50: 66, -40: 68, -30: 70,
+    -20: 72, -10: 75, 0: 77, 10: 80, 20: 82, 30: 85, 40: 88, 50: 91,
+    60: 94, 70: 97, 80: 100, 90: 104, 100: 110
+}
+
+RAW_TO_CELSIUS = {
+    -100: 13, -90: 14, -80: 15, -70: 16, -60: 17, -50: 19, -40: 20, -30: 21,
+    -20: 22, -10: 24, 0: 25, 10: 27, 20: 28, 30: 29, 40: 31, 50: 33,
+    60: 34, 70: 36, 80: 38, 90: 40, 100: 44
+}
+
+
+def raw_to_temp(raw: int, unit: str = "F") -> int:
+    """Convert raw level to temperature."""
+    mapping = RAW_TO_FAHRENHEIT if unit == "F" else RAW_TO_CELSIUS
+    # Find closest key
+    keys = sorted(mapping.keys())
+    closest = min(keys, key=lambda k: abs(k - raw))
+    return mapping[closest]
+
+
+def temp_to_raw(temp: int, unit: str = "F") -> int:
+    """Convert temperature to raw level."""
+    mapping = RAW_TO_FAHRENHEIT if unit == "F" else RAW_TO_CELSIUS
+    # Find closest value
+    for raw, t in sorted(mapping.items()):
+        if t >= temp:
+            return raw
+    return 100
+
+
+def parse_temp_arg(arg: str) -> int:
+    """Parse temperature argument like '68F', '20C', or '-50'."""
+    arg = arg.strip().upper()
+    if arg.endswith("F"):
+        return temp_to_raw(int(arg[:-1]), "F")
+    elif arg.endswith("C"):
+        return temp_to_raw(int(arg[:-1]), "C")
+    else:
+        level = int(arg)
+        if -100 <= level <= 100:
+            return level
+        raise ValueError("Raw level must be between -100 and 100")
+
+
+# CLI Commands
+
+def cmd_login(args):
+    """Configure credentials."""
+    email = args.email or input("Email: ")
+    password = args.password or input("Password: ")
+
+    print("Authenticating...")
+    try:
+        token = authenticate(email, password)
+        config = {"email": email, "password": password}
+        save_config(config)
+        print(f"Logged in as user {token['user_id']}")
+    except Exception as e:
+        print(f"Login failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_logout(args):
+    """Clear cached credentials."""
+    if TOKEN_FILE.exists():
+        TOKEN_FILE.unlink()
+    if CONFIG_FILE.exists():
+        CONFIG_FILE.unlink()
+    print("Logged out.")
+
+
+def cmd_status(args):
+    """Show device status."""
+    token = get_token()
+    user_data = get_user_data(token)
+
+    user_id = token["user_id"]
+    devices = user_data.get("user", {}).get("devices", [])
+
+    if not devices:
+        print("No devices found.")
+        return
+
+    device_id = devices[0]
+    device_data = get_device_data(token, device_id)
+    temp_data = get_temperature(token, user_id)
+
+    # Find which side this user is on
+    device = device_data.get("result", {})
+    left_user = device.get("leftUserId")
+    right_user = device.get("rightUserId")
+
+    side = "left" if left_user == user_id else "right" if right_user == user_id else "unknown"
+
+    current_level = temp_data.get("currentLevel", 0)
+    current_state = temp_data.get("currentState", {}).get("type", "unknown")
+
+    temp_f = raw_to_temp(current_level, "F")
+    temp_c = raw_to_temp(current_level, "C")
+
+    print(f"Side:        {side}")
+    print(f"State:       {current_state}")
+    print(f"Level:       {current_level}")
+    print(f"Temperature: {temp_f}F / {temp_c}C")
+
+    if args.json:
+        print(json.dumps({"temp": temp_data, "device": device}, indent=2))
+
+
+def cmd_temp(args):
+    """Set temperature."""
+    token = get_token()
+    level = parse_temp_arg(args.level)
+
+    print(f"Setting temperature to level {level} ({raw_to_temp(level, 'F')}F)...")
+    set_temperature(token, token["user_id"], level)
+    print("Done.")
+
+
+def cmd_on(args):
+    """Turn on."""
+    token = get_token()
+    print("Turning on...")
+    turn_on(token, token["user_id"])
+    print("Done.")
+
+
+def cmd_off(args):
+    """Turn off."""
+    token = get_token()
+    print("Turning off...")
+    turn_off(token, token["user_id"])
+    print("Done.")
+
+
+def cmd_whoami(args):
+    """Show current user."""
+    token = get_token()
+    print(f"User ID: {token['user_id']}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="eight",
+        description="Control your Eight Sleep Pod from the terminal."
+    )
+    parser.add_argument("--quiet", "-q", action="store_true", help="Suppress info messages")
+
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # login
+    login_parser = subparsers.add_parser("login", help="Configure credentials")
+    login_parser.add_argument("--email", "-e", help="Eight Sleep email")
+    login_parser.add_argument("--password", "-p", help="Eight Sleep password")
+    login_parser.set_defaults(func=cmd_login)
+
+    # logout
+    logout_parser = subparsers.add_parser("logout", help="Clear credentials")
+    logout_parser.set_defaults(func=cmd_logout)
+
+    # status
+    status_parser = subparsers.add_parser("status", help="Show device status")
+    status_parser.add_argument("--json", action="store_true", help="Output JSON")
+    status_parser.set_defaults(func=cmd_status)
+
+    # temp
+    temp_parser = subparsers.add_parser("temp", help="Set temperature (e.g., 68F, 20C, or -50)")
+    temp_parser.add_argument("level", help="Temperature (68F, 20C) or level (-100 to 100)")
+    temp_parser.set_defaults(func=cmd_temp)
+
+    # on
+    on_parser = subparsers.add_parser("on", help="Turn on")
+    on_parser.set_defaults(func=cmd_on)
+
+    # off
+    off_parser = subparsers.add_parser("off", help="Turn off")
+    off_parser.set_defaults(func=cmd_off)
+
+    # whoami
+    whoami_parser = subparsers.add_parser("whoami", help="Show current user ID")
+    whoami_parser.set_defaults(func=cmd_whoami)
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\nAborted.")
+        sys.exit(130)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
