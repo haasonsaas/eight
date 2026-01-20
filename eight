@@ -205,22 +205,22 @@ def get_device_data(token: dict, device_id: str) -> dict:
 
 
 def get_temperature(token: dict, user_id: str) -> dict:
-    url = f"{CLIENT_API_URL}/users/{user_id}/temperature"
+    url = f"{APP_API_URL}/users/{user_id}/temperature"
     return api_request("GET", url, token=token["access_token"])
 
 
 def set_temperature(token: dict, user_id: str, level: int) -> dict:
-    url = f"{CLIENT_API_URL}/users/{user_id}/temperature"
+    url = f"{APP_API_URL}/users/{user_id}/temperature"
     return api_request("PUT", url, {"currentLevel": level}, token=token["access_token"])
 
 
 def turn_on(token: dict, user_id: str) -> dict:
-    url = f"{CLIENT_API_URL}/users/{user_id}/temperature"
+    url = f"{APP_API_URL}/users/{user_id}/temperature"
     return api_request("PUT", url, {"currentState": {"type": "smart"}}, token=token["access_token"])
 
 
 def turn_off(token: dict, user_id: str) -> dict:
-    url = f"{CLIENT_API_URL}/users/{user_id}/temperature"
+    url = f"{APP_API_URL}/users/{user_id}/temperature"
     return api_request("PUT", url, {"currentState": {"type": "off"}}, token=token["access_token"])
 
 
@@ -369,23 +369,38 @@ def cmd_temp(args):
     token, user_id, side = resolve_user_id(args)
     level = parse_temp_arg(args.level)
 
-    print(f"Setting {side} side to level {level} ({format_temp(level)})...")
-    set_temperature(token, user_id, level)
-    print("Done.")
+    try:
+        set_temperature(token, user_id, level)
+        print(f"Set {side} side to level {level} ({format_temp(level)})")
+    except RuntimeError as e:
+        if "offline" in str(e).lower():
+            print(f"Error: Device offline. Check that your Pod is powered on and connected.", file=sys.stderr)
+            sys.exit(1)
+        raise
 
 
 def cmd_on(args):
     token, user_id, side = resolve_user_id(args)
-    print(f"Turning on {side} side...")
-    turn_on(token, user_id)
-    print("Done.")
+    try:
+        turn_on(token, user_id)
+        print(f"Turned on {side} side")
+    except RuntimeError as e:
+        if "offline" in str(e).lower():
+            print(f"Error: Device offline. Check that your Pod is powered on and connected.", file=sys.stderr)
+            sys.exit(1)
+        raise
 
 
 def cmd_off(args):
     token, user_id, side = resolve_user_id(args)
-    print(f"Turning off {side} side...")
-    turn_off(token, user_id)
-    print("Done.")
+    try:
+        turn_off(token, user_id)
+        print(f"Turned off {side} side")
+    except RuntimeError as e:
+        if "offline" in str(e).lower():
+            print(f"Error: Device offline. Check that your Pod is powered on and connected.", file=sys.stderr)
+            sys.exit(1)
+        raise
 
 
 def cmd_whoami(args):
