@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
 Eight Sleep CLI - Control your Eight Sleep Pod from the terminal.
+
+Usage:
+    eight status          Show current status
+    eight temp 68F        Set temperature
+    eight on / off        Turn on/off
+    eight doctor          Health check
 """
 
 import argparse
@@ -9,22 +15,29 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 import urllib.request
 import urllib.error
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"
 
-# API Configuration (from pyEight - extracted from Android APK)
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+# API endpoints (reverse-engineered from pyEight / Android APK)
 AUTH_URL = "https://auth-api.8slp.net/v1/tokens"
 CLIENT_API_URL = "https://client-api.8slp.net/v1"
 APP_API_URL = "https://app-api.8slp.net/v1"
+
+# OAuth credentials (extracted from Eight Sleep Android APK)
 CLIENT_ID = "0894c7f33bb94800a03f1f4df13a4f38"
 CLIENT_SECRET = "f0954a3ed5763ba3d06834c73731a32f15f168f47d4f164751275def86db0c76"
 
-# Headers mimicking Android app
 DEFAULT_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json",
@@ -33,11 +46,20 @@ DEFAULT_HEADERS = {
     "Connection": "keep-alive",
 }
 
+# File paths
 CONFIG_DIR = Path.home() / ".config" / "eight"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 TOKEN_FILE = CONFIG_DIR / "token.json"
+CACHE_FILE = CONFIG_DIR / "cache.json"
 
-# Temperature conversion maps (more granular)
+# Cache settings
+CACHE_MAX_AGE_SECONDS = 3600  # 1 hour for fallback use
+CACHE_STALE_THRESHOLD = 300  # 5 minutes before considered stale
+
+# Global state
+VERBOSE = False
+
+# Temperature conversion tables (from Eight Sleep app)
 RAW_TO_FAHRENHEIT = {
     -100: 55, -90: 57, -80: 59, -70: 61, -60: 63, -50: 66, -40: 68, -30: 70,
     -20: 72, -10: 75, 0: 77, 10: 80, 20: 82, 30: 85, 40: 88, 50: 91,
@@ -52,73 +74,206 @@ RAW_TO_CELSIUS = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config & Token Management
+# Data Source Tracking
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_config() -> dict:
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE) as f:
-            return json.load(f)
-    return {}
+class DataSource(Enum):
+    """Indicates where data came from."""
+    LIVE = "live"
+    CACHED = "cached"
 
 
-def save_config(config: dict):
+@dataclass
+class FetchResult:
+    """Result of a data fetch with source information."""
+    data: Dict[str, Any]
+    source: DataSource
+    age_seconds: int = 0
+
+    @property
+    def is_live(self) -> bool:
+        return self.source == DataSource.LIVE
+
+    @property
+    def is_stale(self) -> bool:
+        return self.age_seconds > CACHE_STALE_THRESHOLD
+
+    def source_indicator(self) -> str:
+        """Return a human-readable source indicator."""
+        if self.source == DataSource.LIVE:
+            return "[LIVE]"
+        else:
+            age_str = format_age(self.age_seconds)
+            return f"[CACHED {age_str} ago]"
+
+
+def format_age(seconds: int) -> str:
+    """Format age in human-readable form."""
+    if seconds < 60:
+        return f"{seconds}s"
+    elif seconds < 3600:
+        return f"{seconds // 60}m"
+    else:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+
+def log(msg: str) -> None:
+    """Print debug message if verbose mode is enabled."""
+    if VERBOSE:
+        print(f"[DEBUG] {msg}", file=sys.stderr)
+
+
+def error(msg: str) -> None:
+    """Print error message to stderr."""
+    print(f"Error: {msg}", file=sys.stderr)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# File Management (Config, Token, Cache)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ensure_config_dir() -> None:
+    """Ensure config directory exists with proper permissions."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=2)
-    os.chmod(CONFIG_FILE, 0o600)
 
 
-def load_token() -> Optional[dict]:
-    if not TOKEN_FILE.exists():
+def load_json_file(path: Path) -> Optional[Dict]:
+    """Load JSON file, return None if missing or invalid."""
+    if not path.exists():
         return None
     try:
-        with open(TOKEN_FILE) as f:
-            token = json.load(f)
-        if token.get("expires_at", 0) > time.time() + 120:
-            return token
-    except (json.JSONDecodeError, KeyError):
-        pass
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        log(f"Failed to load {path}: {e}")
+        return None
+
+
+def save_json_file(path: Path, data: Dict, secure: bool = True) -> None:
+    """Save JSON file with optional secure permissions."""
+    ensure_config_dir()
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    if secure:
+        os.chmod(path, 0o600)
+
+
+def load_config() -> Dict:
+    """Load user configuration (email/password)."""
+    return load_json_file(CONFIG_FILE) or {}
+
+
+def save_config(config: Dict) -> None:
+    """Save user configuration."""
+    save_json_file(CONFIG_FILE, config, secure=True)
+
+
+def load_token() -> Optional[Dict]:
+    """Load cached auth token if still valid."""
+    token = load_json_file(TOKEN_FILE)
+    if token and token.get("expires_at", 0) > time.time() + 120:
+        return token
     return None
 
 
-def save_token(token: dict):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(TOKEN_FILE, "w") as f:
-        json.dump(token, f, indent=2)
-    os.chmod(TOKEN_FILE, 0o600)
+def save_token(token: Dict) -> None:
+    """Save auth token."""
+    save_json_file(TOKEN_FILE, token, secure=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API Layer with Retry
+# Cache Management
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_cache() -> Dict:
+    """Load the full cache."""
+    return load_json_file(CACHE_FILE) or {}
+
+
+def save_to_cache(key: str, data: Dict) -> None:
+    """Save data to cache with timestamp."""
+    cache = load_cache()
+    cache[key] = {
+        "data": data,
+        "timestamp": time.time(),
+        "time_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    save_json_file(CACHE_FILE, cache, secure=False)
+    log(f"Cached {key}")
+
+
+def get_from_cache(key: str, max_age: int = CACHE_MAX_AGE_SECONDS) -> Tuple[Optional[Dict], int]:
+    """
+    Get cached data if not too old.
+    Returns (data, age_seconds) or (None, 0).
+    """
+    cache = load_cache()
+    if key not in cache:
+        return None, 0
+
+    entry = cache[key]
+    age = int(time.time() - entry.get("timestamp", 0))
+    if age < max_age:
+        log(f"Cache hit for {key} (age: {age}s)")
+        return entry.get("data"), age
+
+    log(f"Cache expired for {key} (age: {age}s > max: {max_age}s)")
+    return None, 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP / API Layer
 # ─────────────────────────────────────────────────────────────────────────────
 
 def decode_response(resp) -> bytes:
+    """Decode HTTP response, handling gzip compression."""
     data = resp.read()
     if resp.headers.get("Content-Encoding") == "gzip":
         data = gzip.decompress(data)
     return data
 
 
-def api_request(method: str, url: str, data: dict = None, token: str = None,
-                retries: int = 3, backoff: float = 1.0) -> dict:
-    """Make an API request with retry and exponential backoff."""
+def api_request(
+    method: str,
+    url: str,
+    data: Optional[Dict] = None,
+    token: Optional[str] = None,
+    retries: int = 3,
+    backoff: float = 1.0
+) -> Dict:
+    """
+    Make an API request with retry and exponential backoff.
+
+    Raises RuntimeError on failure.
+    """
     headers = DEFAULT_HEADERS.copy()
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
     body = json.dumps(data).encode() if data else None
-    last_error = None
+    last_error: Optional[Exception] = None
+
+    log(f"{method} {url}")
+    if data:
+        log(f"  Body: {json.dumps(data)}")
 
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method=method)
             with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(decode_response(resp).decode())
+                result = json.loads(decode_response(resp).decode())
+                log(f"  Response: {resp.status} OK")
+                return result
+
         except urllib.error.HTTPError as e:
             error_body = decode_response(e).decode()
+            log(f"  HTTP {e.code}: {error_body[:200]}")
 
-            # Rate limited - wait and retry
+            # Rate limited - retry with backoff
             if e.code == 429:
                 wait = backoff * (2 ** attempt)
                 print(f"Rate limited. Waiting {wait:.1f}s...", file=sys.stderr)
@@ -129,19 +284,20 @@ def api_request(method: str, url: str, data: dict = None, token: str = None,
             # Auth error - don't retry
             if e.code in (401, 403):
                 try:
-                    error_json = json.loads(error_body)
-                    raise RuntimeError(f"Auth error: {error_json}")
+                    err = json.loads(error_body)
+                    raise RuntimeError(f"Auth error: {err}")
                 except json.JSONDecodeError:
                     raise RuntimeError(f"Auth error {e.code}: {error_body}")
 
-            # Other errors
+            # Other HTTP error
             try:
-                error_json = json.loads(error_body)
-                raise RuntimeError(f"API error {e.code}: {error_json}")
+                err = json.loads(error_body)
+                raise RuntimeError(f"API error {e.code}: {err}")
             except json.JSONDecodeError:
                 raise RuntimeError(f"API error {e.code}: {error_body}")
 
         except urllib.error.URLError as e:
+            log(f"  Connection error: {e.reason}")
             last_error = e
             if attempt < retries - 1:
                 wait = backoff * (2 ** attempt)
@@ -150,98 +306,135 @@ def api_request(method: str, url: str, data: dict = None, token: str = None,
                 continue
             raise RuntimeError(f"Connection failed: {e.reason}")
 
-    raise RuntimeError(f"Max retries exceeded. Last error: {last_error}")
+    raise RuntimeError(f"Max retries exceeded: {last_error}")
 
 
-def authenticate(email: str, password: str) -> dict:
-    data = {
+# ─────────────────────────────────────────────────────────────────────────────
+# Authentication
+# ─────────────────────────────────────────────────────────────────────────────
+
+def authenticate(email: str, password: str) -> Dict:
+    """Authenticate with Eight Sleep and return token data."""
+    log(f"Authenticating as {email}...")
+
+    result = api_request("POST", AUTH_URL, {
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "grant_type": "password",
         "username": email,
         "password": password,
-    }
-
-    result = api_request("POST", AUTH_URL, data)
-    expires_in = result.get("expires_in", 3600)
+    })
 
     token_data = {
         "access_token": result["access_token"],
         "user_id": result["userId"],
-        "expires_at": time.time() + expires_in,
+        "expires_at": time.time() + result.get("expires_in", 3600),
     }
     save_token(token_data)
+
+    log(f"Authenticated successfully, user_id={token_data['user_id']}")
     return token_data
 
 
-def get_token() -> dict:
+def get_token() -> Dict:
+    """Get valid auth token, refreshing if necessary."""
     token = load_token()
     if token:
+        expires_in = int(token["expires_at"] - time.time())
+        log(f"Using cached token, expires in {expires_in}s")
         return token
 
+    # Re-authenticate using saved credentials
     config = load_config()
     email = config.get("email")
     password = config.get("password")
 
     if not email or not password:
-        print("Error: Not configured. Run 'eight login' first.", file=sys.stderr)
+        error("Not configured. Run 'eight login' first.")
         sys.exit(1)
 
     return authenticate(email, password)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API Endpoints
+# Eight Sleep API Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_user_data(token: dict) -> dict:
-    url = f"{CLIENT_API_URL}/users/me"
-    return api_request("GET", url, token=token["access_token"])
+def api_get_user(token: Dict) -> Dict:
+    """Get current user data."""
+    return api_request("GET", f"{CLIENT_API_URL}/users/me", token=token["access_token"])
 
 
-def get_device_data(token: dict, device_id: str) -> dict:
-    url = f"{CLIENT_API_URL}/devices/{device_id}"
-    return api_request("GET", url, token=token["access_token"])
+def api_get_device(token: Dict, device_id: str) -> Dict:
+    """Get device data."""
+    return api_request("GET", f"{CLIENT_API_URL}/devices/{device_id}", token=token["access_token"])
 
 
-def get_temperature(token: dict, user_id: str) -> dict:
-    url = f"{APP_API_URL}/users/{user_id}/temperature"
-    return api_request("GET", url, token=token["access_token"])
+def api_get_temperature(token: Dict, user_id: str) -> Dict:
+    """Get temperature settings for a user."""
+    return api_request("GET", f"{APP_API_URL}/users/{user_id}/temperature", token=token["access_token"])
 
 
-def set_temperature(token: dict, user_id: str, level: int) -> dict:
-    url = f"{APP_API_URL}/users/{user_id}/temperature"
-    return api_request("PUT", url, {"currentLevel": level}, token=token["access_token"])
+def api_set_temperature(token: Dict, user_id: str, level: int) -> Dict:
+    """Set temperature level for a user."""
+    return api_request("PUT", f"{APP_API_URL}/users/{user_id}/temperature",
+                       {"currentLevel": level}, token=token["access_token"])
 
 
-def turn_on(token: dict, user_id: str) -> dict:
-    url = f"{APP_API_URL}/users/{user_id}/temperature"
-    return api_request("PUT", url, {"currentState": {"type": "smart"}}, token=token["access_token"])
+def api_set_state(token: Dict, user_id: str, state_type: str) -> Dict:
+    """Set device state (on/off)."""
+    return api_request("PUT", f"{APP_API_URL}/users/{user_id}/temperature",
+                       {"currentState": {"type": state_type}}, token=token["access_token"])
 
 
-def turn_off(token: dict, user_id: str) -> dict:
-    url = f"{APP_API_URL}/users/{user_id}/temperature"
-    return api_request("PUT", url, {"currentState": {"type": "off"}}, token=token["access_token"])
+def api_get_trends(token: Dict, user_id: str, start: str, end: str) -> Dict:
+    """Get sleep trends for a date range."""
+    return api_request("GET", f"{CLIENT_API_URL}/users/{user_id}/trends?tz=UTC&from={start}&to={end}",
+                       token=token["access_token"])
 
 
-def get_user_trends(token: dict, user_id: str, start: str, end: str) -> dict:
-    url = f"{CLIENT_API_URL}/users/{user_id}/trends?tz=UTC&from={start}&to={end}"
-    return api_request("GET", url, token=token["access_token"])
+def api_get_alarms(token: Dict, user_id: str) -> Dict:
+    """Get alarms for a user."""
+    return api_request("GET", f"{APP_API_URL}/users/{user_id}/alarms", token=token["access_token"])
 
 
-def get_alarms(token: dict, user_id: str) -> dict:
-    url = f"{APP_API_URL}/users/{user_id}/alarms"
-    return api_request("GET", url, token=token["access_token"])
+def api_set_alarm(token: Dict, user_id: str, alarm_id: str, data: Dict) -> Dict:
+    """Update alarm settings."""
+    return api_request("PUT", f"{APP_API_URL}/users/{user_id}/alarms/{alarm_id}",
+                       data, token=token["access_token"])
 
 
-def set_alarm(token: dict, user_id: str, alarm_id: str, data: dict) -> dict:
-    url = f"{APP_API_URL}/users/{user_id}/alarms/{alarm_id}"
-    return api_request("PUT", url, data, token=token["access_token"])
+# ─────────────────────────────────────────────────────────────────────────────
+# High-Level Data Fetching (with caching)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_temperature(token: Dict, user_id: str, use_cache_fallback: bool = True) -> FetchResult:
+    """
+    Fetch temperature data, with optional cache fallback on failure.
+    Always caches successful results.
+    """
+    cache_key = f"temperature_{user_id}"
+
+    try:
+        data = api_get_temperature(token, user_id)
+        save_to_cache(cache_key, data)
+        return FetchResult(data=data, source=DataSource.LIVE)
+
+    except RuntimeError as e:
+        if use_cache_fallback:
+            cached_data, age = get_from_cache(cache_key, max_age=86400)  # Allow 24h cache for fallback
+            if cached_data:
+                log(f"API failed, using cached data (age: {age}s)")
+                return FetchResult(data=cached_data, source=DataSource.CACHED, age_seconds=age)
+        raise
 
 
-def get_device_info(token: dict) -> Tuple[dict, str, str, str]:
-    """Get device info and determine user's side. Returns (device, device_id, user_id, side)."""
-    user_data = get_user_data(token)
+def fetch_device_info(token: Dict) -> Tuple[Dict, str, str, str]:
+    """
+    Get device info and determine user's side.
+    Returns (device, device_id, user_id, side).
+    """
+    user_data = api_get_user(token)
     user_id = token["user_id"]
     devices = user_data.get("user", {}).get("devices", [])
 
@@ -249,9 +442,13 @@ def get_device_info(token: dict) -> Tuple[dict, str, str, str]:
         raise RuntimeError("No devices found")
 
     device_id = devices[0]
-    device_data = get_device_data(token, device_id)
+    device_data = api_get_device(token, device_id)
     device = device_data.get("result", {})
 
+    # Cache device info
+    save_to_cache("device", {"device": device, "device_id": device_id, "user_id": user_id})
+
+    # Determine side
     left_user = device.get("leftUserId")
     right_user = device.get("rightUserId")
     side = "left" if left_user == user_id else "right" if right_user == user_id else "unknown"
@@ -259,7 +456,7 @@ def get_device_info(token: dict) -> Tuple[dict, str, str, str]:
     return device, device_id, user_id, side
 
 
-def get_other_user_id(token: dict, device: dict, current_side: str) -> Optional[str]:
+def get_other_user_id(device: Dict, current_side: str) -> Optional[str]:
     """Get the user ID for the other side of the bed."""
     if current_side == "left":
         return device.get("rightUserId")
@@ -269,10 +466,11 @@ def get_other_user_id(token: dict, device: dict, current_side: str) -> Optional[
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Temperature Utilities
+# Temperature Conversion Utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
 def raw_to_temp(raw: int, unit: str = "F") -> int:
+    """Convert raw level (-100 to 100) to temperature."""
     mapping = RAW_TO_FAHRENHEIT if unit == "F" else RAW_TO_CELSIUS
     keys = sorted(mapping.keys())
     closest = min(keys, key=lambda k: abs(k - raw))
@@ -280,6 +478,7 @@ def raw_to_temp(raw: int, unit: str = "F") -> int:
 
 
 def temp_to_raw(temp: int, unit: str = "F") -> int:
+    """Convert temperature to raw level."""
     mapping = RAW_TO_FAHRENHEIT if unit == "F" else RAW_TO_CELSIUS
     for raw, t in sorted(mapping.items()):
         if t >= temp:
@@ -288,6 +487,7 @@ def temp_to_raw(temp: int, unit: str = "F") -> int:
 
 
 def parse_temp_arg(arg: str) -> int:
+    """Parse temperature argument (68F, 20C, or raw level)."""
     arg = arg.strip().upper()
     if arg.endswith("F"):
         return temp_to_raw(int(arg[:-1]), "F")
@@ -301,22 +501,26 @@ def parse_temp_arg(arg: str) -> int:
 
 
 def format_temp(level: int) -> str:
-    return f"{raw_to_temp(level, 'F')}F / {raw_to_temp(level, 'C')}C"
+    """Format temperature for display."""
+    return f"{raw_to_temp(level, 'F')}°F / {raw_to_temp(level, 'C')}°C"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI Commands
+# CLI Command Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def resolve_user_id(args) -> Tuple[dict, str, str]:
-    """Resolve the user ID based on --side flag. Returns (token, user_id, side)."""
+def resolve_user_id(args) -> Tuple[Dict, str, str]:
+    """
+    Resolve the user ID based on --side flag.
+    Returns (token, user_id, side).
+    """
     token = get_token()
-    device, device_id, user_id, my_side = get_device_info(token)
+    device, device_id, user_id, my_side = fetch_device_info(token)
 
     requested_side = getattr(args, 'side', None)
 
     if requested_side and requested_side != my_side:
-        other_user_id = get_other_user_id(token, device, my_side)
+        other_user_id = get_other_user_id(device, my_side)
         if other_user_id:
             return token, other_user_id, requested_side
         else:
@@ -325,104 +529,125 @@ def resolve_user_id(args) -> Tuple[dict, str, str]:
     return token, user_id, my_side
 
 
-def cmd_login(args):
+def handle_offline_error(e: Exception) -> None:
+    """Handle device offline errors consistently."""
+    if "offline" in str(e).lower():
+        error("Device offline. Check that your Pod is powered on and connected.")
+        sys.exit(1)
+    raise e
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI Commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cmd_login(args) -> None:
+    """Configure credentials."""
     email = args.email or input("Email: ")
     password = args.password or input("Password: ")
 
     print("Authenticating...")
     try:
         token = authenticate(email, password)
-        config = {"email": email, "password": password}
-        save_config(config)
+        save_config({"email": email, "password": password})
         print(f"Logged in as user {token['user_id']}")
     except Exception as e:
-        print(f"Login failed: {e}", file=sys.stderr)
+        error(f"Login failed: {e}")
         sys.exit(1)
 
 
-def cmd_logout(args):
-    if TOKEN_FILE.exists():
-        TOKEN_FILE.unlink()
-    if CONFIG_FILE.exists():
-        CONFIG_FILE.unlink()
+def cmd_logout(args) -> None:
+    """Clear credentials and cache."""
+    for f in [TOKEN_FILE, CONFIG_FILE, CACHE_FILE]:
+        if f.exists():
+            f.unlink()
     print("Logged out.")
 
 
-def cmd_status(args):
+def cmd_status(args) -> None:
+    """Show device status."""
     token, user_id, side = resolve_user_id(args)
-    temp_data = get_temperature(token, user_id)
 
+    try:
+        result = fetch_temperature(token, user_id, use_cache_fallback=True)
+    except RuntimeError as e:
+        handle_offline_error(e)
+
+    temp_data = result.data
     current_level = temp_data.get("currentLevel", 0)
     current_state = temp_data.get("currentState", {}).get("type", "unknown")
 
     if args.json:
-        print(json.dumps(temp_data, indent=2))
+        output = temp_data.copy()
+        output["_source"] = result.source.value
+        if result.source == DataSource.CACHED:
+            output["_cache_age_seconds"] = result.age_seconds
+        print(json.dumps(output, indent=2))
         return
 
+    # Show source indicator
+    print(f"{result.source_indicator()}")
     print(f"Side:        {side}")
     print(f"State:       {current_state}")
     print(f"Level:       {current_level}")
     print(f"Temperature: {format_temp(current_level)}")
 
 
-def cmd_temp(args):
+def cmd_temp(args) -> None:
+    """Set temperature."""
     token, user_id, side = resolve_user_id(args)
     level = parse_temp_arg(args.level)
 
     try:
-        set_temperature(token, user_id, level)
+        api_set_temperature(token, user_id, level)
         print(f"Set {side} side to level {level} ({format_temp(level)})")
     except RuntimeError as e:
-        if "offline" in str(e).lower():
-            print(f"Error: Device offline. Check that your Pod is powered on and connected.", file=sys.stderr)
-            sys.exit(1)
-        raise
+        handle_offline_error(e)
 
 
-def cmd_on(args):
+def cmd_on(args) -> None:
+    """Turn on."""
     token, user_id, side = resolve_user_id(args)
     try:
-        turn_on(token, user_id)
+        api_set_state(token, user_id, "smart")
         print(f"Turned on {side} side")
     except RuntimeError as e:
-        if "offline" in str(e).lower():
-            print(f"Error: Device offline. Check that your Pod is powered on and connected.", file=sys.stderr)
-            sys.exit(1)
-        raise
+        handle_offline_error(e)
 
 
-def cmd_off(args):
+def cmd_off(args) -> None:
+    """Turn off."""
     token, user_id, side = resolve_user_id(args)
     try:
-        turn_off(token, user_id)
+        api_set_state(token, user_id, "off")
         print(f"Turned off {side} side")
     except RuntimeError as e:
-        if "offline" in str(e).lower():
-            print(f"Error: Device offline. Check that your Pod is powered on and connected.", file=sys.stderr)
-            sys.exit(1)
-        raise
+        handle_offline_error(e)
 
 
-def cmd_whoami(args):
+def cmd_whoami(args) -> None:
+    """Show current user and device info."""
     token = get_token()
-    device, device_id, user_id, side = get_device_info(token)
+    device, device_id, user_id, side = fetch_device_info(token)
+
+    online_status = "online" if device.get("online") else "offline"
 
     print(f"User ID:   {user_id}")
     print(f"Device ID: {device_id}")
     print(f"Side:      {side}")
+    print(f"Status:    {online_status}")
 
-    # Show other user if present
-    other_id = get_other_user_id(token, device, side)
+    other_id = get_other_user_id(device, side)
     if other_id:
         other_side = "right" if side == "left" else "left"
         print(f"Partner:   {other_id} ({other_side})")
 
 
-def cmd_presence(args):
+def cmd_presence(args) -> None:
+    """Check if someone is in bed."""
     token = get_token()
-    device, device_id, user_id, my_side = get_device_info(token)
+    device, device_id, user_id, my_side = fetch_device_info(token)
 
-    # Get presence from device data
     left_presence = device.get("leftPresence", False)
     right_presence = device.get("rightPresence", False)
 
@@ -430,7 +655,7 @@ def cmd_presence(args):
         print(json.dumps({"left": left_presence, "right": right_presence}))
         return
 
-    def status(present):
+    def status(present: bool) -> str:
         return "in bed" if present else "not in bed"
 
     if args.side:
@@ -441,10 +666,10 @@ def cmd_presence(args):
         print(f"Right: {status(right_presence)}")
 
 
-def cmd_sleep(args):
+def cmd_sleep(args) -> None:
+    """Show sleep metrics."""
     token, user_id, side = resolve_user_id(args)
 
-    # Default to last 7 days
     days = args.days or 7
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days)
@@ -452,7 +677,7 @@ def cmd_sleep(args):
     start = start_date.strftime("%Y-%m-%d")
     end = end_date.strftime("%Y-%m-%d")
 
-    trends = get_user_trends(token, user_id, start, end)
+    trends = api_get_trends(token, user_id, start, end)
 
     if args.json:
         print(json.dumps(trends, indent=2))
@@ -465,7 +690,7 @@ def cmd_sleep(args):
 
     print(f"Sleep data for {side} side ({len(days_data)} nights):\n")
 
-    for day in reversed(days_data[-7:]):  # Show last 7
+    for day in reversed(days_data[-7:]):
         date = day.get("day", "Unknown")
         score = day.get("score", 0)
         duration_sec = day.get("sleepDuration", 0)
@@ -487,9 +712,10 @@ def cmd_sleep(args):
         print()
 
 
-def cmd_alarms(args):
+def cmd_alarms(args) -> None:
+    """List alarms."""
     token, user_id, side = resolve_user_id(args)
-    alarms_data = get_alarms(token, user_id)
+    alarms_data = api_get_alarms(token, user_id)
 
     if args.json:
         print(json.dumps(alarms_data, indent=2))
@@ -507,7 +733,6 @@ def cmd_alarms(args):
         enabled = alarm.get("enabled", False)
         time_str = alarm.get("time", "00:00:00")[:5]
 
-        # Get repeat days
         repeat = alarm.get("repeat", {}).get("weekDays", {})
         days = [d[:3].title() for d, v in repeat.items() if v]
         days_str = ", ".join(days) if days else "Once"
@@ -523,18 +748,17 @@ def cmd_alarms(args):
         print(f"        ID: {alarm_id}...")
 
 
-def cmd_alarm_set(args):
+def cmd_alarm_set(args) -> None:
+    """Set alarm time."""
     token, user_id, side = resolve_user_id(args)
 
-    # Parse time
     time_parts = args.time.split(":")
     if len(time_parts) == 2:
         time_str = f"{time_parts[0].zfill(2)}:{time_parts[1].zfill(2)}:00"
     else:
         time_str = args.time
 
-    # Get existing alarms to find the first one
-    alarms_data = get_alarms(token, user_id)
+    alarms_data = api_get_alarms(token, user_id)
     alarms = alarms_data.get("alarms", [])
 
     if not alarms:
@@ -542,19 +766,15 @@ def cmd_alarm_set(args):
         return
 
     alarm = alarms[0]
-    alarm_id = alarm["id"]
-
-    # Update the alarm
-    update_data = {"time": time_str, "enabled": True}
-
-    set_alarm(token, user_id, alarm_id, update_data)
+    api_set_alarm(token, user_id, alarm["id"], {"time": time_str, "enabled": True})
     print(f"Alarm set to {time_str[:5]} on {side} side.")
 
 
-def cmd_alarm_toggle(args, enable: bool):
+def cmd_alarm_toggle(args, enable: bool) -> None:
+    """Enable or disable alarm."""
     token, user_id, side = resolve_user_id(args)
 
-    alarms_data = get_alarms(token, user_id)
+    alarms_data = api_get_alarms(token, user_id)
     alarms = alarms_data.get("alarms", [])
 
     if not alarms:
@@ -562,18 +782,141 @@ def cmd_alarm_toggle(args, enable: bool):
         return
 
     alarm = alarms[0]
-    alarm_id = alarm["id"]
-
-    set_alarm(token, user_id, alarm_id, {"enabled": enable})
+    api_set_alarm(token, user_id, alarm["id"], {"enabled": enable})
     state = "enabled" if enable else "disabled"
     print(f"Alarm {state} on {side} side.")
 
 
-def cmd_version(args):
+def cmd_schedule(args) -> None:
+    """View temperature schedule."""
+    token, user_id, side = resolve_user_id(args)
+
+    try:
+        result = fetch_temperature(token, user_id, use_cache_fallback=True)
+    except RuntimeError as e:
+        handle_offline_error(e)
+
+    if args.json:
+        print(json.dumps(result.data.get("settings", {}), indent=2))
+        return
+
+    settings = result.data.get("settings", {})
+    schedule_type = settings.get("scheduleType", "unknown")
+    smart = settings.get("smart", {})
+    schedules = settings.get("schedules", [])
+
+    print(f"{result.source_indicator()}")
+    print(f"Schedule for {side} side:\n")
+    print(f"Type: {schedule_type}")
+
+    if smart:
+        print(f"\nSmart temperatures:")
+        print(f"  Bedtime:       {format_temp(smart.get('bedTimeLevel', 0))}")
+        print(f"  Initial sleep: {format_temp(smart.get('initialSleepLevel', 0))}")
+        print(f"  Final sleep:   {format_temp(smart.get('finalSleepLevel', 0))}")
+
+    if schedules:
+        print(f"\nSchedules:")
+        for sched in schedules:
+            enabled = "ON " if sched.get("enabled") else "OFF"
+            time_str = sched.get("time", "00:00:00")[:5]
+            days = sched.get("days", [])
+            days_str = ", ".join([d[:3].title() for d in days]) if days else "None"
+            print(f"  [{enabled}] {time_str}  {days_str}")
+
+
+def cmd_doctor(args) -> None:
+    """Health check - verify everything is working."""
+    print("Eight Sleep CLI Health Check\n")
+    print("=" * 40)
+    errors = []
+
+    # 1. Check config
+    print("\n1. Configuration")
+    config = load_config()
+    if config.get("email") and config.get("password"):
+        print(f"   ✓ Credentials configured ({config['email']})")
+    else:
+        print("   ✗ No credentials")
+        errors.append("Run 'eight login' to configure credentials")
+
+    # 2. Check token
+    print("\n2. Authentication")
+    token = None
+    try:
+        token = get_token()
+        expires_in = int(token["expires_at"] - time.time())
+        print(f"   ✓ Token valid (expires in {expires_in // 60}m)")
+    except Exception as e:
+        print(f"   ✗ Auth failed: {e}")
+        errors.append(f"Authentication failed: {e}")
+
+    # 3. Check API connectivity
+    if token:
+        print("\n3. API Connectivity")
+        try:
+            user_data = api_get_user(token)
+            devices = user_data.get("user", {}).get("devices", [])
+            print(f"   ✓ API reachable ({len(devices)} device(s))")
+        except Exception as e:
+            print(f"   ✗ API unreachable: {e}")
+            errors.append(f"API connectivity failed: {e}")
+
+        # 4. Check device
+        print("\n4. Device Status")
+        try:
+            device, device_id, user_id, side = fetch_device_info(token)
+            if device.get("online"):
+                print(f"   ✓ Device online (you're on {side} side)")
+            else:
+                print(f"   ✗ Device OFFLINE (you're on {side} side)")
+                errors.append("Device is offline. Check Pod power and network.")
+        except Exception as e:
+            print(f"   ✗ Device check failed: {e}")
+            errors.append(f"Device check failed: {e}")
+
+        # 5. Check temperature endpoint
+        print("\n5. Temperature Endpoint")
+        try:
+            result = fetch_temperature(token, token["user_id"], use_cache_fallback=False)
+            level = result.data.get("currentLevel", 0)
+            print(f"   ✓ Temperature API OK (level {level})")
+        except Exception as e:
+            print(f"   ✗ Temperature endpoint failed: {e}")
+            errors.append(f"Temperature endpoint failed: {e}")
+
+    # 6. Check cache
+    print("\n6. Cache")
+    cache = load_cache()
+    if cache:
+        entries = []
+        for key, entry in cache.items():
+            age = int(time.time() - entry.get("timestamp", 0))
+            entries.append(f"{key}: {format_age(age)} old")
+        print(f"   ✓ {len(cache)} cached entries")
+        for e in entries:
+            print(f"     - {e}")
+    else:
+        print("   - Empty (will populate on use)")
+
+    # Summary
+    print("\n" + "=" * 40)
+    if errors:
+        print(f"\n⚠ {len(errors)} ISSUE(S) FOUND:\n")
+        for i, err in enumerate(errors, 1):
+            print(f"  {i}. {err}")
+        sys.exit(1)
+    else:
+        print("\n✓ ALL CHECKS PASSED")
+
+
+def cmd_version(args) -> None:
+    """Show version."""
     print(f"eight {__version__}")
 
 
-def cmd_completion(args):
+def cmd_completion(args) -> None:
+    """Generate shell completion script."""
     shell = args.shell
 
     if shell == "bash":
@@ -582,7 +925,7 @@ _eight_completion() {
     local cur prev commands
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="login logout status temp on off whoami presence sleep alarms alarm-on alarm-off alarm-set version completion"
+    commands="login logout status temp on off whoami presence sleep alarms alarm-on alarm-off alarm-set schedule doctor version completion"
 
     case "$prev" in
         eight)
@@ -595,14 +938,13 @@ _eight_completion() {
             COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
             ;;
         *)
-            COMPREPLY=($(compgen -W "--side --json --help" -- "$cur"))
+            COMPREPLY=($(compgen -W "--side --json --help --verbose" -- "$cur"))
             ;;
     esac
 }
 complete -F _eight_completion eight
 
-# Add to ~/.bashrc:
-# eval "$(eight completion bash)"
+# Add to ~/.bashrc: eval "$(eight completion bash)"
 ''')
 
     elif shell == "zsh":
@@ -625,6 +967,8 @@ _eight() {
         'alarm-on:Enable alarm'
         'alarm-off:Disable alarm'
         'alarm-set:Set alarm time'
+        'schedule:View temperature schedule'
+        'doctor:Health check'
         'version:Show version'
         'completion:Generate shell completion'
     )
@@ -632,6 +976,7 @@ _eight() {
     _arguments -C \\
         '--side[Bed side]:side:(left right)' \\
         '--json[Output JSON]' \\
+        '--verbose[Debug output]' \\
         '1: :->command' \\
         '*::arg:->args'
 
@@ -644,8 +989,7 @@ _eight() {
 
 _eight "$@"
 
-# Add to ~/.zshrc:
-# eval "$(eight completion zsh)"
+# Add to ~/.zshrc: eval "$(eight completion zsh)"
 ''')
 
     elif shell == "fish":
@@ -665,31 +1009,37 @@ complete -c eight -n "__fish_use_subcommand" -a alarms -d "List alarms"
 complete -c eight -n "__fish_use_subcommand" -a alarm-on -d "Enable alarm"
 complete -c eight -n "__fish_use_subcommand" -a alarm-off -d "Disable alarm"
 complete -c eight -n "__fish_use_subcommand" -a alarm-set -d "Set alarm time"
+complete -c eight -n "__fish_use_subcommand" -a schedule -d "View temperature schedule"
+complete -c eight -n "__fish_use_subcommand" -a doctor -d "Health check"
 complete -c eight -n "__fish_use_subcommand" -a version -d "Show version"
 complete -c eight -n "__fish_use_subcommand" -a completion -d "Generate shell completion"
 
 complete -c eight -l side -d "Bed side" -a "left right"
 complete -c eight -l json -d "Output JSON"
+complete -c eight -l verbose -d "Debug output"
 
 # Save to ~/.config/fish/completions/eight.fish
 ''')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main
+# Argument Parser Setup
 # ─────────────────────────────────────────────────────────────────────────────
 
-def add_side_arg(parser):
+def add_side_arg(parser: argparse.ArgumentParser) -> None:
+    """Add --side argument to a parser."""
     parser.add_argument("--side", "-s", choices=["left", "right"],
                         help="Bed side (default: your side)")
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser."""
     parser = argparse.ArgumentParser(
         prog="eight",
         description="Control your Eight Sleep Pod from the terminal."
     )
     parser.add_argument("--version", "-V", action="store_true", help="Show version")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Debug output")
 
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
@@ -700,7 +1050,7 @@ def main():
     p.set_defaults(func=cmd_login)
 
     # logout
-    p = subparsers.add_parser("logout", help="Clear credentials")
+    p = subparsers.add_parser("logout", help="Clear credentials and cache")
     p.set_defaults(func=cmd_logout)
 
     # status
@@ -764,6 +1114,16 @@ def main():
     add_side_arg(p)
     p.set_defaults(func=cmd_alarm_set)
 
+    # schedule
+    p = subparsers.add_parser("schedule", help="View temperature schedule")
+    p.add_argument("--json", "-j", action="store_true", help="Output JSON")
+    add_side_arg(p)
+    p.set_defaults(func=cmd_schedule)
+
+    # doctor
+    p = subparsers.add_parser("doctor", help="Health check - verify everything works")
+    p.set_defaults(func=cmd_doctor)
+
     # version
     p = subparsers.add_parser("version", help="Show version")
     p.set_defaults(func=cmd_version)
@@ -773,7 +1133,20 @@ def main():
     p.add_argument("shell", choices=["bash", "zsh", "fish"], help="Shell type")
     p.set_defaults(func=cmd_completion)
 
+    return parser
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main Entry Point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    global VERBOSE
+
+    parser = build_parser()
     args = parser.parse_args()
+
+    VERBOSE = args.verbose
 
     if args.version:
         cmd_version(args)
@@ -789,7 +1162,10 @@ def main():
         print("\nAborted.")
         sys.exit(130)
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        if VERBOSE:
+            import traceback
+            traceback.print_exc()
+        error(str(e))
         sys.exit(1)
 
 

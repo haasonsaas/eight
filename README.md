@@ -17,7 +17,7 @@ Requires Python 3.7+.
 # Login
 eight login
 
-# Status
+# Status (shows [LIVE] or [CACHED] indicator)
 eight status
 eight status --json
 eight status --side right    # Check partner's side
@@ -48,9 +48,19 @@ eight alarm-set 7:30         # Set alarm time
 eight alarm-on               # Enable alarm
 eight alarm-off              # Disable alarm
 
+# Temperature schedule
+eight schedule               # View smart temperature settings
+eight schedule --json
+
+# Health check
+eight doctor                 # Diagnose connectivity issues
+
 # Info
 eight whoami
 eight version
+
+# Debug mode
+eight status --verbose       # Show API requests/responses
 
 # Shell completions
 eval "$(eight completion bash)"   # Bash
@@ -64,15 +74,21 @@ eight completion fish > ~/.config/fish/completions/eight.fish
 - **Presence detection** - Check if someone is in bed
 - **Sleep metrics** - View sleep scores, HRV, heart rate, breathing rate
 - **Alarms** - List, enable, disable, and set alarm times
+- **Temperature schedules** - View smart temperature settings
 - **Side selection** - Control either side of the bed with `--side`
+- **Health check** - `eight doctor` diagnoses connectivity and auth issues
+- **Live/Cached indicator** - Output shows `[LIVE]` or `[CACHED 5m ago]` so you know data freshness
+- **Offline resilience** - Falls back to cached data when device is offline
 - **Retry logic** - Automatic retry with exponential backoff for rate limits
 - **Shell completions** - Tab completion for bash, zsh, and fish
 - **JSON output** - Machine-readable output for scripting
+- **Debug mode** - `--verbose` flag shows all API requests
 
 ## Config
 
 Credentials stored at `~/.config/eight/config.json` (mode 600).
 Token cached at `~/.config/eight/token.json` and auto-refreshes.
+State cached at `~/.config/eight/cache.json` for offline fallback.
 
 ## Credits
 
